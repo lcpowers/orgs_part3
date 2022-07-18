@@ -1,0 +1,199 @@
+---
+title: "Organics/spillover/econ project"
+author: "Claire Powers"
+date: '2022-07-17'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Set up and data
+```{r packages}
+rm(list=ls())
+
+setwd("~/Desktop/CurrentProjects/orgs_econ/")
+
+library(tidyverse)
+library(sf) 
+library(raster)
+library(fasterize)
+library(terra)
+library(vroom)
+library(spatialEco)
+library(landscapemetrics)
+library(reshape2)
+
+ca_albers = st_crs(3310)
+# ca_albers = "+proj=aea +lat_1=34 +lat_2=40.5 +lat_0=0 +lon_0=-120 +x_0=0 +y_0=-4000000 +ellps=GRS80 +datum=NAD83 +units=m +no_defs"
+
+years = 2003:2020
+```
+
+## Raster template
+```{r ras_template}
+
+##### Raster template #####
+template.res = 30
+ras.template = raster()
+extent(ras.template) = extent(orgs)
+res(ras.template) = template.res
+projection(ras.template) = ca_albers
+crs(ras.template) = ca_albers
+# turn raster to SpatRaster for terra package approach
+ras.temp.Spat = rast(ras.template)
+
+rm(ras.template)
+```
+
+
+The metrics you've already crunched are perfect--specifically 
+- edge_samefarm (adj mat)
+- ed_farm (landmet on perm #)
+- aggind
+- cohesionind
+- pladj
+
+Big loop
+```{r processing}
+
+years = 2003:2004
+
+for(y in years){
+  
+  ##### Read in data #####
+  orgs = read_sf(paste0("Raw/kern",y,".shp")) %>% 
+    st_transform(ca_albers) %>% 
+    mutate(perm.num = as.numeric(PERMIT),
+           permsite.num = as.numeric(as.factor(PMT_SITE)))
+  orgs.rasterize = filter(orgs, P_STATUS=="A")
+  orgs.centroids = st_centroid(orgs)
+  
+  permsite_cw = as.data.frame(orgs) %>% 
+    dplyr::select(permtst=PMT_SITE,ras_prm = permsite.num) %>% 
+    rbind(.,data.frame(permtst="background",ras_prm=-1))
+  
+  perm_permsit_cw = as.data.frame(orgs) %>% 
+    dplyr::select(permtst = PMT_SITE,ag_prmt = PERMIT)
+  
+  ##### Rasterize on permitnumber #####
+  tmp.Spat.Vec = as(orgs,"Spatial") %>% vect(crs=ca_albers)
+  
+  perm.ras = terra::rasterize(x=tmp.Spat.Vec,
+                             y=ras.temp.Spat,
+                             field="perm.num",
+                             touches=TRUE,
+                             background=-1)
+  
+  permsite.ras = terra::rasterize(x=tmp.Spat.Vec,
+                             y=ras.temp.Spat,
+                             field="permsite.num",
+                             touches=TRUE,
+                             background=-1)
+  
+  ######### Find edge_sameFarm #########
+  
+  # Get permitsite adjacencies
+  adj_mat = get_adjacencies(permsite.ras,upper=T)[[1]] 
+  
+  # Convert adjacency matrix to long format, remove rows where adjacency = 0, then find the edge length of shared edges
+  adj_df = adj_mat %>% 
+    as.data.frame() %>% # Convert adjacency matrix to dataframe
+    rownames_to_column("focalfield") %>% # Add a column of the plotid
+    pivot_longer(-focalfield,names_to = c("neighbor"),values_to = "Nsharededges") %>% # go from matrix to long table format
+    filter(focalfield!=neighbor&Nsharededges>0) %>% # Filter for shared edges (>0) that aren't between pixels in the same field (plotid1!=plotid2)
+    filter(focalfield!=-1) %>% # Remove focal background rows
+    mutate(edgelength = Nsharededges*template.res) # Find edge length based on raster resolution 
+  
+  # Convert the permitsite value used in rasters back to permitsite in the original orgs dataset
+  adj_df2 = merge(permsite_cw,adj_df,by.x="ras_prm",by.y="focalfield") %>% # Merge adjacency dataframe with permitsite number-permitsite crosswalk based on focal field
+    mutate(focalpermtst=permtst) %>% # create new focal permitsite column 
+    dplyr::select(-permtst) %>% # remove old permitsite
+    merge(.,permsite_cw,by.x="neighbor",by.y="ras_prm") %>% # merge again with crosswalk to bring in permitsite for neighbor fields
+    mutate(neighborpermtst=permtst) %>% # create neighbor permitsite column
+    dplyr::select(focalpermtst,neighborpermtst,Nsharededges,edgelength) # keep important columns
+  
+  # Find shared edge between fields with different permitsite IDs but within same farm
+  perm_sharededge = adj_df2 %>% 
+    merge(.,perm_permsit_cw,by.x='focalpermtst',by.y='permtst') %>% # Merge adjdf2 with permit-permitsite crosswalk based on focal permitsite
+    mutate(focalag_prmt=ag_prmt) %>% dplyr::select(-ag_prmt) %>% # rename column for clarity
+    merge(.,perm_permsit_cw,by.x='neighborpermtst',by.y='permtst') %>% # merge adjdf2 with permit-permitsite crosswalk based on neighbor permitsite
+    mutate(neighborag_prmt=ag_prmt) %>%  dplyr::select(-ag_prmt) %>% # rename column for clarity
+    filter(neighborag_prmt==focalag_prmt) %>% # Filter for rows where neighbor and focal permit numbers are the same
+    group_by(focalpermtst) %>% # Group by focal permitsite
+    summarize(edgelength=sum(edgelength),.groups = "drop") # sum total edge length of shared farms by permitsite
+  colnames(perm_sharededge)=c("permtst","edge_sameFarm") # Rename columns for clarity
+  
+  # join with geometry
+  perm_sharededge2 = dplyr::select(orgs,PMT_SITE) %>% merge(.,perm_sharededge,by.x = "PMT_SITE",by.y="permtst")
+  
+  # Filter tmp_orgs for fields missed in the perm_shared edge 
+  perm_missed = dplyr::select(orgs,PMT_SITE) %>% filter(!PMT_SITE%in%perm_sharededge2$PMT_SITE)
+  
+  # spatial join between perm_missed and perm_sharededge2
+  perm_join = st_join(perm_missed,perm_sharededge2,largest=T) %>% as.data.frame() %>% dplyr::select(permtst=PMT_SITE.x,edge_sameFarm)
+  
+  # Fill in NAs with 0
+  perm_join$edge_sameFarm[is.na(perm_join$edge_sameFarm)]=0
+  
+  # Join missed and not missed edge_sameFarm dfs
+  perm_sharededge3 = rbind(perm_sharededge,perm_join)
+  
+  out = merge(orgs,perm_sharededge3,by.x="PMT_SITE", by.y ="permtst") %>% as.data.frame() %>%
+    dplyr::select(-geometry) 
+  write_csv(out,paste0("output/edgelengths/edge_sameFarm",y,".csv"))
+  rm(adj_df,adj_df2,adj_mat)
+  ######### End find edge same farm #########
+  
+  ##### Cohesion/edge metrics at landscape level #####
+  orgs.centroids = sample_n(orgs.centroids,10)
+  
+  ls_output = sample_lsm(landscape=perm.ras,
+                y=orgs.centroids,
+                metric=c("cohesion","ai","ed","pland","pladj"),
+                shape = "circle",
+                level='landscape',
+                size=2500,
+                plot_id = orgs.centroids$PMT_SITE,
+                consider_boundary=T,
+                full_name=F)
+  
+  ls_out = ls_output %>%
+    dplyr::select(permitsite=plot_id,metric,value) %>%
+    arrange(permitsite) %>% 
+    mutate(year=y)
+
+  write_csv(ls_out,paste0("output/landscapemetrics/ls/permnum_",y,".csv"))
+  rm(ls_output,ls_out)
+  ##### End landscape level permit number fragstats #####
+
+  ##### Cohesion/clumpy metrics at class level #####
+  c_output = sample_lsm(landscape=perm.ras,
+                y=orgs.centroids,
+                metric=c("cohesion","ai","ed","pland","pladj"),
+                shape = "circle",
+                level='class',
+                size=2500,
+                plot_id = orgs.centroids$PMT_SITE,
+                consider_boundary=T,
+                full_name=F,
+                return_raster = F)
+  
+  c_out = c_output %>%
+    dplyr::select(permitsite=plot_id,permit=class,metric,value) %>%
+    arrange(permitsite) %>% 
+    mutate(year=y) %>% 
+    filter(permit!=-1) %>% 
+    filter(substr(permitsite,1,nchar(permit))==as.character(permit))
+
+  write_csv(out,paste0("output/landscapemetrics/c/permnum_",y,".csv"))
+  rm(c_out,c_output)
+  ##### End class level permit number fragstats #####
+  
+  rm(orgs,orgs.centroids,orgs.rasterize,out,perm_join,perm_missed,perm_permsit_cw,perm_sharededge,perm_sharededge2,perm_sharededge3)
+  rm(permsite_cw,perm.ras,permsite.ras)
+}
+
+```
+
